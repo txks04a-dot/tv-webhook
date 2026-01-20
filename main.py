@@ -5,57 +5,121 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# File path for logs (NDJSON: 1 JSON object per line)
+# -----------------------------
+# Configuration (env variables)
+# -----------------------------
 LOG_PATH = os.environ.get("LOG_PATH", "alerts.ndjson")
+COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "120"))
 
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+# -----------------------------
+# Helpers
+# -----------------------------
+def utc_now():
+    return datetime.now(timezone.utc)
+
+def utc_now_iso():
+    return utc_now().isoformat()
 
 def safe_json(obj):
-    """Make sure we can always write something, even if obj isn't perfectly JSON serializable."""
     try:
         json.dumps(obj)
         return obj
     except TypeError:
         return {"_nonserializable": str(obj)}
 
+def parse_iso(ts):
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+def last_alert_time_for_symbol(symbol):
+    """Scan log file backwards and return last alert time for symbol."""
+    if not os.path.exists(LOG_PATH):
+        return None
+
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+            payload = record.get("payload", {})
+            if payload.get("symbol") == symbol:
+                ts = record.get("received_at_utc")
+                return parse_iso(ts)
+        except Exception:
+            continue
+
+    return None
+
+# -----------------------------
+# Routes
+# -----------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    # Accept JSON body
     data = request.get_json(silent=True)
 
     if data is None:
         return jsonify({"status": "error", "message": "Expected JSON body"}), 400
 
-    # Build a normalized log record
+    symbol = data.get("symbol")
+    now = utc_now()
+
+    last_time = last_alert_time_for_symbol(symbol)
+    cooldown_ok = True
+    seconds_since_last = None
+
+    if last_time:
+        seconds_since_last = (now - last_time).total_seconds()
+        if seconds_since_last < COOLDOWN_SECONDS:
+            cooldown_ok = False
+
     record = {
         "received_at_utc": utc_now_iso(),
-        "remote_addr": request.headers.get("X-Forwarded-For", request.remote_addr),
-        "user_agent": request.headers.get("User-Agent"),
         "payload": safe_json(data),
+        "cooldown": {
+            "cooldown_seconds": COOLDOWN_SECONDS,
+            "cooldown_ok": cooldown_ok,
+            "seconds_since_last": seconds_since_last
+        }
     }
 
-    # Append to NDJSON file
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
-        # Still return error so you can see problems quickly
-        return jsonify({"status": "error", "message": f"Failed to write log: {e}"}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    # Also print a short line to Render logs (handy for live monitoring)
     direction = data.get("direction")
-    symbol = data.get("symbol")
     tf = data.get("timeframe")
-    expiry = data.get("expiry_minutes")
-    print(f"ALERT OK | {symbol} | TF={tf} | {direction} | EXP={expiry}m")
+    exp = data.get("expiry_minutes")
 
-    return jsonify({"status": "ok"}), 200
+    print(
+        f"ALERT | {symbol} | {direction} | TF={tf} | "
+        f"EXP={exp}m | cooldown_ok={cooldown_ok}"
+    )
+
+    return jsonify({"status": "ok", "cooldown_ok": cooldown_ok}), 200
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "message": "tv-webhook is running"}), 200
+    return jsonify({"status": "ok", "service": "tv-webhook"}), 200
+
+@app.route("/count", methods=["GET"])
+def count():
+    try:
+        if not os.path.exists(LOG_PATH):
+            return jsonify({"count": 0}), 200
+        with open(LOG_PATH, "r", encoding="utf-8") as f:
+            c = sum(1 for _ in f)
+        return jsonify({"count": c}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    # Render binds to port 10000 in your setup, keep it consistent.
     app.run(host="0.0.0.0", port=10000)
+
