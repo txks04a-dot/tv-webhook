@@ -109,17 +109,18 @@ def webhook():
     confidence = calculate_confidence(data, cooldown_ok)
 allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
 
-    record = {
-    "received_at_utc": utc_now_iso(),
-    "payload": safe_json(data),
-    "cooldown": {
-        "cooldown_seconds": COOLDOWN_SECONDS,
-        "cooldown_ok": cooldown_ok,
-        "seconds_since_last": seconds_since_last
-    },
-    "confidence": confidence,
-    "allowed": allowed
-}
+        record = {
+        "received_at_utc": utc_now_iso(),
+        "payload": safe_json(data),
+        "cooldown": {
+            "cooldown_seconds": COOLDOWN_SECONDS,
+            "cooldown_ok": cooldown_ok,
+            "seconds_since_last": seconds_since_last
+        },
+        "confidence": confidence,
+        "allowed": allowed
+    }
+
 
 
 
@@ -168,6 +169,7 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
