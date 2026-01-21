@@ -56,6 +56,32 @@ def last_alert_time_for_symbol(symbol):
 
     return None
 
+def calculate_confidence(payload, cooldown_ok):
+    score = 0
+
+    # Direction present
+    if payload.get("direction") in ("CALL", "PUT"):
+        score += 20
+
+    # Timeframe alignment
+    if str(payload.get("timeframe")) == "1":
+        score += 20
+
+    # Expiry alignment
+    if payload.get("expiry_minutes") == 1:
+        score += 20
+
+    # Cooldown passed
+    if cooldown_ok:
+        score += 20
+
+    # Symbol sanity check
+    if payload.get("symbol"):
+        score += 20
+
+    return score
+
+
 # -----------------------------
 # Routes
 # -----------------------------
@@ -78,15 +104,19 @@ def webhook():
         if seconds_since_last < COOLDOWN_SECONDS:
             cooldown_ok = False
 
+    confidence = calculate_confidence(data, cooldown_ok)
+
     record = {
-        "received_at_utc": utc_now_iso(),
-        "payload": safe_json(data),
-        "cooldown": {
-            "cooldown_seconds": COOLDOWN_SECONDS,
-            "cooldown_ok": cooldown_ok,
-            "seconds_since_last": seconds_since_last
-        }
-    }
+    "received_at_utc": utc_now_iso(),
+    "payload": safe_json(data),
+    "cooldown": {
+        "cooldown_seconds": COOLDOWN_SECONDS,
+        "cooldown_ok": cooldown_ok,
+        "seconds_since_last": seconds_since_last
+    },
+    "confidence": confidence
+}
+
 
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -100,11 +130,16 @@ def webhook():
 
     app.logger.warning(
     f"ALERT | {symbol} | {direction} | TF={tf} | "
-    f"EXP={exp}m | cooldown_ok={cooldown_ok}"
+    f"EXP={exp}m | cooldown_ok={cooldown_ok} | confidence={confidence}"
 )
 
 
-    return jsonify({"status": "ok", "cooldown_ok": cooldown_ok}), 200
+
+    return jsonify({
+    "status": "ok",
+    "cooldown_ok": cooldown_ok,
+    "confidence": confidence
+}), 200
 
 @app.route("/", methods=["GET"])
 def health():
@@ -123,5 +158,6 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
