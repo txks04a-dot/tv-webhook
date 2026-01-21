@@ -10,6 +10,8 @@ app = Flask(__name__)
 # -----------------------------
 LOG_PATH = os.environ.get("LOG_PATH", "alerts.ndjson")
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "120"))
+MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "80"))
+
 
 # -----------------------------
 # Helpers
@@ -105,6 +107,7 @@ def webhook():
             cooldown_ok = False
 
     confidence = calculate_confidence(data, cooldown_ok)
+allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
 
     record = {
     "received_at_utc": utc_now_iso(),
@@ -114,8 +117,11 @@ def webhook():
         "cooldown_ok": cooldown_ok,
         "seconds_since_last": seconds_since_last
     },
-    "confidence": confidence
+    "confidence": confidence,
+    "allowed": allowed
 }
+
+
 
 
     try:
@@ -130,16 +136,20 @@ def webhook():
 
     app.logger.warning(
     f"ALERT | {symbol} | {direction} | TF={tf} | "
-    f"EXP={exp}m | cooldown_ok={cooldown_ok} | confidence={confidence}"
+    f"EXP={exp}m | cooldown_ok={cooldown_ok} | "
+    f"confidence={confidence} | allowed={allowed}"
 )
+
 
 
 
     return jsonify({
     "status": "ok",
     "cooldown_ok": cooldown_ok,
-    "confidence": confidence
+    "confidence": confidence,
+    "allowed": allowed
 }), 200
+
 
 @app.route("/", methods=["GET"])
 def health():
@@ -158,6 +168,7 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
