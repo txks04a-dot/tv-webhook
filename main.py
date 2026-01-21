@@ -98,10 +98,11 @@ def webhook():
     tf = data.get("timeframe")
     exp = data.get("expiry_minutes")
 
-    print(
-        f"ALERT | {symbol} | {direction} | TF={tf} | "
-        f"EXP={exp}m | cooldown_ok={cooldown_ok}"
-    )
+    app.logger.warning(
+    f"ALERT | {symbol} | {direction} | TF={tf} | "
+    f"EXP={exp}m | cooldown_ok={cooldown_ok}"
+)
+
 
     return jsonify({"status": "ok", "cooldown_ok": cooldown_ok}), 200
 
@@ -122,4 +123,5 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
