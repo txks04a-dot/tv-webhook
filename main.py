@@ -106,10 +106,12 @@ def webhook():
         if seconds_since_last < COOLDOWN_SECONDS:
             cooldown_ok = False
 
+    # ✅ Confidence + enforcement
     confidence = calculate_confidence(data, cooldown_ok)
-allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
+    allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
 
-        record = {
+    # ✅ Record (correctly indented)
+    record = {
         "received_at_utc": utc_now_iso(),
         "payload": safe_json(data),
         "cooldown": {
@@ -120,10 +122,6 @@ allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
         "confidence": confidence,
         "allowed": allowed
     }
-
-
-
-
 
     try:
         with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -136,20 +134,17 @@ allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
     exp = data.get("expiry_minutes")
 
     app.logger.warning(
-    f"ALERT | {symbol} | {direction} | TF={tf} | "
-    f"EXP={exp}m | cooldown_ok={cooldown_ok} | "
-    f"confidence={confidence} | allowed={allowed}"
-)
-
-
-
+        f"ALERT | {symbol} | {direction} | TF={tf} | "
+        f"EXP={exp}m | cooldown_ok={cooldown_ok} | "
+        f"confidence={confidence} | allowed={allowed}"
+    )
 
     return jsonify({
-    "status": "ok",
-    "cooldown_ok": cooldown_ok,
-    "confidence": confidence,
-    "allowed": allowed
-}), 200
+        "status": "ok",
+        "cooldown_ok": cooldown_ok,
+        "confidence": confidence,
+        "allowed": allowed
+    }), 200
 
 
 @app.route("/", methods=["GET"])
@@ -169,6 +164,7 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
