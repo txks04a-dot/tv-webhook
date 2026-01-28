@@ -60,28 +60,60 @@ def last_alert_time_for_symbol(symbol):
 
 def calculate_confidence(payload, cooldown_ok):
     score = 0
+    breakdown = {}
 
-    # Direction present
-    if payload.get("direction") in ("CALL", "PUT"):
+    # 1️⃣ Supertrend alignment
+    if payload.get("direction") == payload.get("supertrend_dir"):
+        breakdown["supertrend"] = 25
+        score += 25
+    else:
+        breakdown["supertrend"] = 0
+
+    # 2️⃣ ADX strength
+    adx = payload.get("adx", 0)
+    if adx >= 30:
+        breakdown["adx"] = 25
+        score += 25
+    elif adx >= 25:
+        breakdown["adx"] = 18
+        score += 18
+    elif adx >= 20:
+        breakdown["adx"] = 10
+        score += 10
+    else:
+        breakdown["adx"] = 0
+
+    # 3️⃣ Stochastic quality
+    k = payload.get("stoch_k", 0)
+    d = payload.get("stoch_d", 0)
+    if payload.get("direction") == "CALL" and k > d and k > 50:
+        breakdown["stoch"] = 20
         score += 20
-
-    # Timeframe alignment
-    if str(payload.get("timeframe")) == "1":
+    elif payload.get("direction") == "PUT" and k < d and k < 50:
+        breakdown["stoch"] = 20
         score += 20
+    else:
+        breakdown["stoch"] = 0
 
-    # Expiry alignment
-    if payload.get("expiry_minutes") == 1:
+    # 4️⃣ Keltner location
+    kp = payload.get("keltner_pos")
+    if kp in ("upper", "lower"):
+        breakdown["keltner"] = 20
         score += 20
+    elif kp == "middle":
+        breakdown["keltner"] = 10
+        score += 10
+    else:
+        breakdown["keltner"] = 0
 
-    # Cooldown passed
+    # 5️⃣ Cooldown
     if cooldown_ok:
-        score += 20
+        breakdown["cooldown"] = 10
+        score += 10
+    else:
+        breakdown["cooldown"] = 0
 
-    # Symbol sanity check
-    if payload.get("symbol"):
-        score += 20
-
-    return score
+    return score, breakdown
 
 
 # -----------------------------
@@ -164,6 +196,7 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
