@@ -139,8 +139,9 @@ def webhook():
             cooldown_ok = False
 
     # ✅ Confidence + enforcement
-    confidence = calculate_confidence(data, cooldown_ok)
+    confidence, confidence_breakdown = calculate_confidence(data, cooldown_ok)
     allowed = (confidence >= MIN_CONFIDENCE) and cooldown_ok
+
 
     # ✅ Record (correctly indented)
     record = {
@@ -152,6 +153,7 @@ def webhook():
             "seconds_since_last": seconds_since_last
         },
         "confidence": confidence,
+        "confidence_breakdown": confidence_breakdown,
         "allowed": allowed
     }
 
@@ -166,10 +168,12 @@ def webhook():
     exp = data.get("expiry_minutes")
 
     app.logger.warning(
-        f"ALERT | {symbol} | {direction} | TF={tf} | "
-        f"EXP={exp}m | cooldown_ok={cooldown_ok} | "
-        f"confidence={confidence} | allowed={allowed}"
-    )
+    f"ALERT | {symbol} | {direction} | TF={tf} | "
+    f"EXP={exp}m | cooldown_ok={cooldown_ok} | "
+    f"confidence={confidence} | allowed={allowed} | "
+    f"breakdown={confidence_breakdown}"
+)
+
 
     return jsonify({
         "status": "ok",
@@ -196,6 +200,7 @@ def count():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
+
 
 
 
