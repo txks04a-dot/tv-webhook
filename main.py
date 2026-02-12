@@ -155,7 +155,6 @@ def calculate_confidence(payload: dict, cooldown_ok: bool):
     # ADX sanity (up to 25)
     try:
         adx_f = float(adx)
-        # If payload includes adx_min you could compare; otherwise, tier it.
         if adx_f >= 25:
             breakdown["adx"] = 25
         elif adx_f >= 20:
@@ -181,7 +180,6 @@ def calculate_confidence(payload: dict, cooldown_ok: bool):
         reasons.append("stoch missing/unparseable")
 
     # Keltner position (20)
-    # Your strategy is mean-reversion: CALL near lower, PUT near upper.
     if kpos in ("upper", "middle", "lower"):
         if direction == "CALL" and kpos == "lower":
             breakdown["keltner"] = 20
@@ -202,19 +200,21 @@ def calculate_confidence(payload: dict, cooldown_ok: bool):
 # -----------------------------
 # Paper trade lifecycle
 # -----------------------------
+def timedelta_minutes(m: int):
+    from datetime import timedelta
+    return timedelta(minutes=int(m))
+
 def create_paper_trade(symbol: str, direction: str, expiry_minutes: int, payload: dict, confidence: int, breakdown: dict):
     trade_id = str(uuid.uuid4())
     now = utc_now()
     created_iso = now.isoformat()
 
-    # Entry price: if you include close in SIGNAL payload, great; otherwise None.
     entry_price = payload.get("close")
     try:
         entry_price = float(entry_price) if entry_price is not None else None
     except Exception:
         entry_price = None
 
-    # Use tv_time_ms if present (more “chart-true”), else server time.
     tv_time_ms = payload.get("tv_time_ms")
     try:
         tv_time_ms = int(tv_time_ms) if tv_time_ms is not None else None
@@ -242,20 +242,15 @@ def create_paper_trade(symbol: str, direction: str, expiry_minutes: int, payload
         "source_alert_received_at_utc": created_iso,
         "source_tv_time_ms": tv_time_ms,
 
-        "entry_price": entry_price,   # may be None unless you send close on signal
+        "entry_price": entry_price,
         "exit_price": None,
-        "result": None,               # WIN / LOSS / TIE
-        "pnl": None,                  # +stake*payout, -stake, or 0
+        "result": None,
+        "pnl": None,
 
-        # When we should settle this trade (server-based)
         "expires_at_utc": (now + timedelta_minutes(expiry_minutes)).isoformat(),
     }
     ndjson_append(TRADES_PATH, trade)
     return trade
-
-def timedelta_minutes(m: int):
-    from datetime import timedelta
-    return timedelta(minutes=int(m))
 
 def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
     """
@@ -279,14 +274,10 @@ def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
             continue
 
         exp = parse_iso(t.get("expires_at_utc"))
-        if not exp:
-            continue
-        if now < exp:
+        if not exp or now < exp:
             continue
 
         entry = t.get("entry_price")
-        # If you never sent entry_price on signal, we can’t evaluate outcome accurately.
-        # We still mark it CLOSED but as "UNKNOWN" unless entry exists.
         try:
             entry_f = float(entry) if entry is not None else None
         except Exception:
@@ -329,7 +320,6 @@ def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
         resolved_count += 1
 
     if changed:
-        # Rewrite file safely (small file expected in demo)
         tmp = TRADES_PATH + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             for t in trades:
@@ -353,19 +343,59 @@ def webhook():
 
     received_at = utc_now_iso()
 
-    # Always log raw inbound first (but keep it lightweight)
     base_record = {
         "received_at_utc": received_at,
         "event_type": event_type,
         "payload": safe_json(data),
     }
 
+    # -----------------------------
     # Handle BAR heartbeat
+    # Supports:
+    #  A) per-symbol bar: {"type":"bar","symbol":"EURUSD","close":1.08}
+    #  B) master bar: {"type":"bar","prices":{"EURUSD":1.08,"USDJPY":153.2}}
+    # -----------------------------
     if event_type == "bar":
-        # Optional: close from heartbeat; needed to resolve paper trades
+        prices = data.get("prices")
+
+        # Route B: master bar with prices map
+        if isinstance(prices, dict) and prices:
+            resolved_total = 0
+            symbols_seen = 0
+
+            for sym, close_val in prices.items():
+                sym_norm = normalize_symbol(sym)
+                if not sym_norm:
+                    continue
+                try:
+                    close_float = float(close_val)
+                except Exception:
+                    continue
+
+                symbols_seen += 1
+                resolved_total += resolve_expired_trades_for_symbol(sym_norm, close_float)
+
+            base_record["bar"] = {
+                "mode": "master_prices",
+                "symbols_in_payload": symbols_seen,
+                "resolved_trades": resolved_total,
+            }
+            ndjson_append(LOG_PATH, base_record)
+
+            app.logger.warning(f"BAR(master) | symbols={symbols_seen} | resolved={resolved_total}")
+            return jsonify({
+                "status": "ok",
+                "type": "bar",
+                "mode": "master_prices",
+                "symbols": symbols_seen,
+                "resolved_trades": resolved_total,
+            }), 200
+
+        # Route A: standard per-symbol bar
         close_val = data.get("close")
         resolved = 0
         close_float = None
+
         if close_val is not None and symbol:
             try:
                 close_float = float(close_val)
@@ -374,6 +404,7 @@ def webhook():
                 pass
 
         base_record["bar"] = {
+            "mode": "single_symbol",
             "symbol": symbol,
             "close": close_float,
             "resolved_trades": resolved,
@@ -381,9 +412,17 @@ def webhook():
         ndjson_append(LOG_PATH, base_record)
 
         app.logger.warning(f"BAR | {symbol} | close={close_float} | resolved={resolved}")
-        return jsonify({"status": "ok", "type": "bar", "symbol": symbol, "resolved_trades": resolved}), 200
+        return jsonify({
+            "status": "ok",
+            "type": "bar",
+            "mode": "single_symbol",
+            "symbol": symbol,
+            "resolved_trades": resolved
+        }), 200
 
+    # -----------------------------
     # Handle SIGNAL
+    # -----------------------------
     if not symbol:
         base_record["rejected"] = {"reason": "missing symbol"}
         ndjson_append(LOG_PATH, base_record)
@@ -394,7 +433,6 @@ def webhook():
         ndjson_append(LOG_PATH, base_record)
         return jsonify({"status": "ok", "allowed": False, "reason": "symbol_not_allowlisted"}), 200
 
-    # Cooldown check (signals only)
     now_dt = utc_now()
     last_time = last_signal_time_for_symbol(symbol)
     cooldown_ok = True
@@ -407,13 +445,11 @@ def webhook():
     confidence, breakdown, reasons = calculate_confidence(data, cooldown_ok)
     confidence_ok = confidence >= MIN_CONFIDENCE
 
-    # Daily limit check
     day_count = trades_today_count()
     daily_ok = day_count < MAX_TRADES_PER_DAY
     if not daily_ok:
         reasons.append("max_trades_per_day reached")
 
-    # Max open per symbol check
     open_for_symbol = open_trades_for_symbol(symbol)
     per_symbol_ok = len(open_for_symbol) < MAX_OPEN_TRADES_PER_SYMBOL
     if not per_symbol_ok:
@@ -421,7 +457,6 @@ def webhook():
 
     allowed = cooldown_ok and confidence_ok and daily_ok and per_symbol_ok
 
-    # Log the signal evaluation
     base_record["cooldown"] = {
         "cooldown_seconds": COOLDOWN_SECONDS,
         "cooldown_ok": cooldown_ok,
@@ -433,7 +468,6 @@ def webhook():
     base_record["reasons"] = reasons
     ndjson_append(LOG_PATH, base_record)
 
-    # If not allowed, stop here
     if not allowed:
         app.logger.warning(
             f"ALERT | {symbol} | {direction} | TF={data.get('timeframe')} | "
@@ -450,14 +484,10 @@ def webhook():
             "reasons": reasons,
         }), 200
 
-    # EXECUTION
     trade = None
     if EXECUTION_MODE == "paper":
         expiry = int(data.get("expiry_minutes", 1))
         trade = create_paper_trade(symbol, direction, expiry, data, confidence, breakdown)
-    else:
-        # mode off -> allowed but no execution
-        trade = None
 
     app.logger.warning(
         f"ALERT | {symbol} | {direction} | TF={data.get('timeframe')} | "
@@ -483,7 +513,6 @@ def health():
 
 @app.route("/count", methods=["GET"])
 def count():
-    # Alert log line count
     try:
         if not os.path.exists(LOG_PATH):
             return jsonify({"count": 0}), 200
@@ -515,12 +544,14 @@ def summary():
     ties = sum(1 for t in trades if t.get("result") == "TIE")
     unknown = sum(1 for t in trades if t.get("result") == "UNKNOWN")
     open_count = sum(1 for t in trades if t.get("status") == "OPEN")
+
     pnl = 0.0
     for t in trades:
         try:
             pnl += float(t.get("pnl") or 0.0)
         except Exception:
             continue
+
     return jsonify({
         "mode": EXECUTION_MODE,
         "open": open_count,
@@ -534,6 +565,5 @@ def summary():
 
 
 if __name__ == "__main__":
-    # Render sets PORT; fall back to 10000
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
