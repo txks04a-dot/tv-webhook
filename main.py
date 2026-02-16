@@ -178,6 +178,162 @@ def today_date_str() -> str:
     except Exception:
         return utc_now().date().isoformat()
 
+def compute_metrics(trades: list[dict], last_n: int | None = None) -> dict:
+    """
+    Compute performance metrics from trades list.
+    Uses CLOSED trades for most calculations.
+    Drawdown is computed from cumulative pnl over CLOSED trades in chronological order.
+    """
+    # Optional window
+    if last_n is not None and last_n > 0:
+        trades = trades[-last_n:]
+
+    total = len(trades)
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    closed = [t for t in trades if t.get("status") == "CLOSED"]
+
+    # Sort closed trades by closed time (fallback to created time)
+    def _ts(t):
+        return t.get("closed_at_utc") or t.get("created_at_utc") or ""
+
+    closed_sorted = sorted(closed, key=_ts)
+
+    # Result counts
+    wins = sum(1 for t in closed_sorted if t.get("result") == "WIN")
+    losses = sum(1 for t in closed_sorted if t.get("result") == "LOSS")
+    ties = sum(1 for t in closed_sorted if t.get("result") == "TIE")
+    unknown = sum(1 for t in closed_sorted if t.get("result") == "UNKNOWN")
+
+    decided = wins + losses  # exclude ties/unknown
+    closed_count = len(closed_sorted)
+
+    # PnL aggregates
+    pnl_sum = 0.0
+    win_pnl = 0.0
+    loss_pnl = 0.0
+    for t in closed_sorted:
+        try:
+            p = float(t.get("pnl") or 0.0)
+        except Exception:
+            p = 0.0
+        pnl_sum += p
+        if p > 0:
+            win_pnl += p
+        elif p < 0:
+            loss_pnl += (-p)
+
+    avg_pnl_closed = (pnl_sum / closed_count) if closed_count else 0.0
+    expectancy_per_decided = (pnl_sum / decided) if decided else 0.0  # useful when ignoring ties/unknown
+
+    # Win rates
+    win_rate_decided = (wins / decided) if decided else 0.0
+    win_rate_closed = (wins / closed_count) if closed_count else 0.0  # includes ties/unknown in denominator
+    tie_rate_closed = (ties / closed_count) if closed_count else 0.0
+
+    # Profit factor
+    profit_factor = (win_pnl / loss_pnl) if loss_pnl > 0 else (float("inf") if win_pnl > 0 else 0.0)
+
+    # Equity curve + max drawdown
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in closed_sorted:
+        try:
+            equity += float(t.get("pnl") or 0.0)
+        except Exception:
+            pass
+        if equity > peak:
+            peak = equity
+        dd = peak - equity
+        if dd > max_dd:
+            max_dd = dd
+
+    # Streaks (based on closed results only, in chronological order)
+    # Track current streak and max win/loss streak
+    current_streak_type = None  # "WIN"/"LOSS"/"TIE"/"UNKNOWN"
+    current_streak_len = 0
+
+    max_win_streak = 0
+    max_loss_streak = 0
+
+    win_streak = 0
+    loss_streak = 0
+
+    for t in closed_sorted:
+        r = t.get("result") or "UNKNOWN"
+
+        # current streak
+        if r == current_streak_type:
+            current_streak_len += 1
+        else:
+            current_streak_type = r
+            current_streak_len = 1
+
+        # win/loss streaks
+        if r == "WIN":
+            win_streak += 1
+            loss_streak = 0
+        elif r == "LOSS":
+            loss_streak += 1
+            win_streak = 0
+        else:
+            # ties/unknown reset both win/loss streaks
+            win_streak = 0
+            loss_streak = 0
+
+        if win_streak > max_win_streak:
+            max_win_streak = win_streak
+        if loss_streak > max_loss_streak:
+            max_loss_streak = loss_streak
+
+    # Recent result (last closed trade)
+    last_closed = closed_sorted[-1] if closed_sorted else None
+
+    return {
+        "counts": {
+            "total_records": total,
+            "open": len(open_trades),
+            "closed": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "unknown": unknown,
+            "decided": decided,
+        },
+        "rates": {
+            "win_rate_decided": round(win_rate_decided, 6),
+            "win_rate_closed": round(win_rate_closed, 6),
+            "tie_rate_closed": round(tie_rate_closed, 6),
+        },
+        "pnl": {
+            "sum": round(pnl_sum, 6),
+            "avg_per_closed_trade": round(avg_pnl_closed, 6),
+            "expectancy_per_decided_trade": round(expectancy_per_decided, 6),
+            "gross_profit": round(win_pnl, 6),
+            "gross_loss": round(loss_pnl, 6),
+            "profit_factor": (profit_factor if profit_factor in (0.0, float("inf")) else round(profit_factor, 6)),
+            "max_drawdown": round(max_dd, 6),
+            "ending_equity": round(equity, 6),
+        },
+        "streaks": {
+            "current": {
+                "type": current_streak_type,
+                "len": current_streak_len if closed_count else 0,
+            },
+            "max_win_streak": max_win_streak,
+            "max_loss_streak": max_loss_streak,
+        },
+        "last_closed_trade": {
+            "id": last_closed.get("id") if last_closed else None,
+            "symbol": last_closed.get("symbol") if last_closed else None,
+            "direction": last_closed.get("direction") if last_closed else None,
+            "result": last_closed.get("result") if last_closed else None,
+            "pnl": last_closed.get("pnl") if last_closed else None,
+            "closed_at_utc": last_closed.get("closed_at_utc") if last_closed else None,
+            "confidence": last_closed.get("confidence") if last_closed else None,
+        } if last_closed else None,
+    }
+
 # -----------------------------
 # Cooldown / Limits
 # -----------------------------
@@ -681,3 +837,4 @@ def summary():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
