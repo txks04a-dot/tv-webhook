@@ -1,16 +1,49 @@
 import os
 import json
 import uuid
+import errno
+import tempfile
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
+# Optional (but recommended) for correct "trading day" logic.
+# If you don't want this dependency, you can remove it and keep UTC day counting.
+try:
+    from zoneinfo import ZoneInfo  # py3.9+
+except Exception:
+    ZoneInfo = None
+
 app = Flask(__name__)
+
+# ============================================================
+# DURABILITY FIX (Render):
+# - Local container FS is ephemeral across deploys/restarts.
+# - Use a persistent disk mount and write NDJSON there.
+#
+# On Render: create a Persistent Disk and mount it, e.g. at /var/data
+# Then set env:
+#   DATA_DIR=/var/data
+# ============================================================
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data").strip() or "/var/data"
+
+def ensure_dir(path: str) -> None:
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        # If /var/data isn't mounted (local dev), fall back to current directory
+        pass
+
+# If DATA_DIR can't be created (e.g., not mounted), fallback safely to working dir
+ensure_dir(DATA_DIR)
+if not os.path.isdir(DATA_DIR):
+    DATA_DIR = os.getcwd()
 
 # -----------------------------
 # Configuration (env variables)
 # -----------------------------
-LOG_PATH = os.environ.get("LOG_PATH", "alerts.ndjson")
-TRADES_PATH = os.environ.get("TRADES_PATH", "trades.ndjson")
+# Store these in persistent dir by default
+LOG_PATH = os.environ.get("LOG_PATH", os.path.join(DATA_DIR, "alerts.ndjson"))
+TRADES_PATH = os.environ.get("TRADES_PATH", os.path.join(DATA_DIR, "trades.ndjson"))
 
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", "300"))
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "80"))
@@ -23,6 +56,10 @@ MAX_OPEN_TRADES_PER_SYMBOL = int(os.environ.get("MAX_OPEN_TRADES_PER_SYMBOL", "1
 
 PAPER_STAKE = float(os.environ.get("PAPER_STAKE", "1"))
 PAPER_PAYOUT = float(os.environ.get("PAPER_PAYOUT", "0.80"))
+
+# Day boundary (recommended): align your "day" with NY session
+# Set e.g. DAY_TZ=America/New_York
+DAY_TZ = os.environ.get("DAY_TZ", "America/New_York").strip()
 
 # Parse allowlist
 ALLOWLIST = set()
@@ -51,33 +88,95 @@ def safe_json(obj):
     except TypeError:
         return {"_nonserializable": str(obj)}
 
+def _fsync_file(f):
+    """Best-effort fsync to reduce data loss on sudden restarts."""
+    try:
+        f.flush()
+        os.fsync(f.fileno())
+    except Exception:
+        pass
+
 def ndjson_append(path: str, record: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
+    # Ensure parent dir exists
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    # Append-only, durable-ish writes
+    line = json.dumps(record, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.write(line)
+        _fsync_file(f)
 
 def ndjson_read_all(path: str):
     if not os.path.exists(path):
         return []
     out = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except Exception:
+                    continue
+    except Exception:
+        return []
     return out
+
+def atomic_write_ndjson(path: str, records: list[dict]) -> None:
+    """
+    Atomic rewrite (used when resolving expired trades).
+    Writes to a temp file in the SAME directory, fsyncs, then replaces.
+    This avoids partial writes if the process is killed mid-write.
+    """
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            _fsync_file(f)
+
+        os.replace(tmp_path, path)
+
+        # Best-effort fsync directory entry (Linux)
+        try:
+            dir_fd = os.open(parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except Exception:
+            pass
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
 
 def normalize_symbol(sym):
     if not sym:
         return None
     return str(sym).strip().upper()
 
-def today_utc_date_str() -> str:
-    return utc_now().date().isoformat()
+def today_date_str() -> str:
+    """
+    Trading-day key. Default: America/New_York (recommended for your 03:00–17:00 NY session).
+    Falls back to UTC if zoneinfo isn't available.
+    """
+    if ZoneInfo is None:
+        return utc_now().date().isoformat()
+
+    try:
+        tz = ZoneInfo(DAY_TZ)
+        return datetime.now(tz).date().isoformat()
+    except Exception:
+        return utc_now().date().isoformat()
 
 # -----------------------------
 # Cooldown / Limits
@@ -106,12 +205,13 @@ def last_signal_time_for_symbol(symbol: str):
     return None
 
 def trades_today_count():
-    """Count number of paper trades created today (UTC)."""
+    """Count number of paper trades created today (DAY_TZ)."""
     if not os.path.exists(TRADES_PATH):
         return 0
+    day_key = today_date_str()
     c = 0
     for t in ndjson_read_all(TRADES_PATH):
-        if t.get("created_date_utc") == today_utc_date_str():
+        if t.get("created_date_key") == day_key:
             c += 1
     return c
 
@@ -221,6 +321,8 @@ def create_paper_trade(symbol: str, direction: str, expiry_minutes: int, payload
     except Exception:
         tv_time_ms = None
 
+    day_key = today_date_str()
+
     trade = {
         "id": trade_id,
         "mode": EXECUTION_MODE,
@@ -238,7 +340,10 @@ def create_paper_trade(symbol: str, direction: str, expiry_minutes: int, payload
         "breakdown": breakdown,
 
         "created_at_utc": created_iso,
+        # Keep UTC date too (useful), but COUNT on created_date_key
         "created_date_utc": now.date().isoformat(),
+        "created_date_key": day_key,
+
         "source_alert_received_at_utc": created_iso,
         "source_tv_time_ms": tv_time_ms,
 
@@ -292,23 +397,26 @@ def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
             t["result"] = "UNKNOWN"
             t["pnl"] = 0.0
         else:
+            stake = float(t.get("stake", PAPER_STAKE))
+            payout = float(t.get("payout", PAPER_PAYOUT))
+
             if t.get("direction") == "CALL":
                 if exit_f > entry_f:
                     t["result"] = "WIN"
-                    t["pnl"] = round(float(t.get("stake", PAPER_STAKE)) * float(t.get("payout", PAPER_PAYOUT)), 6)
+                    t["pnl"] = round(stake * payout, 6)
                 elif exit_f < entry_f:
                     t["result"] = "LOSS"
-                    t["pnl"] = -round(float(t.get("stake", PAPER_STAKE)), 6)
+                    t["pnl"] = -round(stake, 6)
                 else:
                     t["result"] = "TIE"
                     t["pnl"] = 0.0
             elif t.get("direction") == "PUT":
                 if exit_f < entry_f:
                     t["result"] = "WIN"
-                    t["pnl"] = round(float(t.get("stake", PAPER_STAKE)) * float(t.get("payout", PAPER_PAYOUT)), 6)
+                    t["pnl"] = round(stake * payout, 6)
                 elif exit_f > entry_f:
                     t["result"] = "LOSS"
-                    t["pnl"] = -round(float(t.get("stake", PAPER_STAKE)), 6)
+                    t["pnl"] = -round(stake, 6)
                 else:
                     t["result"] = "TIE"
                     t["pnl"] = 0.0
@@ -320,11 +428,7 @@ def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
         resolved_count += 1
 
     if changed:
-        tmp = TRADES_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            for t in trades:
-                f.write(json.dumps(t, ensure_ascii=False) + "\n")
-        os.replace(tmp, TRADES_PATH)
+        atomic_write_ndjson(TRADES_PATH, trades)
 
     return resolved_count
 
@@ -508,7 +612,15 @@ def webhook():
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "tv-webhook", "mode": EXECUTION_MODE}), 200
+    return jsonify({
+        "status": "ok",
+        "service": "tv-webhook",
+        "mode": EXECUTION_MODE,
+        "data_dir": DATA_DIR,
+        "trades_path": TRADES_PATH,
+        "alerts_path": LOG_PATH,
+        "day_tz": DAY_TZ,
+    }), 200
 
 
 @app.route("/count", methods=["GET"])
@@ -561,6 +673,8 @@ def summary():
         "unknown": unknown,
         "pnl": round(pnl, 6),
         "today_trades": trades_today_count(),
+        "day_tz": DAY_TZ,
+        "data_dir": DATA_DIR,
     }), 200
 
 
