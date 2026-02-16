@@ -838,3 +838,32 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
 
+@app.route("/metrics", methods=["GET"])
+def metrics():
+    """
+    /metrics
+      - default: all trades in file
+      - optional: ?last_n=200 to compute over last N records
+    """
+    trades = ndjson_read_all(TRADES_PATH)
+
+    # Optional window parameter
+    last_n = request.args.get("last_n", default=None, type=int)
+    if last_n is not None and last_n <= 0:
+        last_n = None
+
+    out = compute_metrics(trades, last_n=last_n)
+
+    # Helpful context
+    out["meta"] = {
+        "mode": EXECUTION_MODE,
+        "data_dir": DATA_DIR,
+        "trades_path": TRADES_PATH,
+        "day_tz": DAY_TZ,
+        "today_trades": trades_today_count(),
+        "window_last_n": last_n,
+        "generated_at_utc": utc_now_iso(),
+    }
+
+    return jsonify(out), 200
+
