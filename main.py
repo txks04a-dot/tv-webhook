@@ -1,13 +1,11 @@
 import os
 import json
 import uuid
-import errno
 import tempfile
 from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
-# Optional (but recommended) for correct "trading day" logic.
-# If you don't want this dependency, you can remove it and keep UTC day counting.
+# Optional (recommended) for correct "trading day" logic.
 try:
     from zoneinfo import ZoneInfo  # py3.9+
 except Exception:
@@ -26,14 +24,14 @@ app = Flask(__name__)
 # ============================================================
 DATA_DIR = os.environ.get("DATA_DIR", "/var/data").strip() or "/var/data"
 
+
 def ensure_dir(path: str) -> None:
     try:
         os.makedirs(path, exist_ok=True)
     except Exception:
-        # If /var/data isn't mounted (local dev), fall back to current directory
         pass
 
-# If DATA_DIR can't be created (e.g., not mounted), fallback safely to working dir
+
 ensure_dir(DATA_DIR)
 if not os.path.isdir(DATA_DIR):
     DATA_DIR = os.getcwd()
@@ -41,7 +39,6 @@ if not os.path.isdir(DATA_DIR):
 # -----------------------------
 # Configuration (env variables)
 # -----------------------------
-# Store these in persistent dir by default
 LOG_PATH = os.environ.get("LOG_PATH", os.path.join(DATA_DIR, "alerts.ndjson"))
 TRADES_PATH = os.environ.get("TRADES_PATH", os.path.join(DATA_DIR, "trades.ndjson"))
 
@@ -58,7 +55,6 @@ PAPER_STAKE = float(os.environ.get("PAPER_STAKE", "1"))
 PAPER_PAYOUT = float(os.environ.get("PAPER_PAYOUT", "0.80"))
 
 # Day boundary (recommended): align your "day" with NY session
-# Set e.g. DAY_TZ=America/New_York
 DAY_TZ = os.environ.get("DAY_TZ", "America/New_York").strip()
 
 # Parse allowlist
@@ -89,7 +85,6 @@ def safe_json(obj):
         return {"_nonserializable": str(obj)}
 
 def _fsync_file(f):
-    """Best-effort fsync to reduce data loss on sudden restarts."""
     try:
         f.flush()
         os.fsync(f.fileno())
@@ -97,12 +92,10 @@ def _fsync_file(f):
         pass
 
 def ndjson_append(path: str, record: dict) -> None:
-    # Ensure parent dir exists
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    # Append-only, durable-ish writes
     line = json.dumps(record, ensure_ascii=False) + "\n"
     with open(path, "a", encoding="utf-8") as f:
         f.write(line)
@@ -127,11 +120,6 @@ def ndjson_read_all(path: str):
     return out
 
 def atomic_write_ndjson(path: str, records: list[dict]) -> None:
-    """
-    Atomic rewrite (used when resolving expired trades).
-    Writes to a temp file in the SAME directory, fsyncs, then replaces.
-    This avoids partial writes if the process is killed mid-write.
-    """
     parent = os.path.dirname(path) or "."
     os.makedirs(parent, exist_ok=True)
 
@@ -165,180 +153,18 @@ def normalize_symbol(sym):
     return str(sym).strip().upper()
 
 def today_date_str() -> str:
-    """
-    Trading-day key. Default: America/New_York (recommended for your 03:00–17:00 NY session).
-    Falls back to UTC if zoneinfo isn't available.
-    """
     if ZoneInfo is None:
         return utc_now().date().isoformat()
-
     try:
         tz = ZoneInfo(DAY_TZ)
         return datetime.now(tz).date().isoformat()
     except Exception:
         return utc_now().date().isoformat()
 
-def compute_metrics(trades: list[dict], last_n: int | None = None) -> dict:
-    """
-    Compute performance metrics from trades list.
-    Uses CLOSED trades for most calculations.
-    Drawdown is computed from cumulative pnl over CLOSED trades in chronological order.
-    """
-    # Optional window
-    if last_n is not None and last_n > 0:
-        trades = trades[-last_n:]
-
-    total = len(trades)
-    open_trades = [t for t in trades if t.get("status") == "OPEN"]
-    closed = [t for t in trades if t.get("status") == "CLOSED"]
-
-    # Sort closed trades by closed time (fallback to created time)
-    def _ts(t):
-        return t.get("closed_at_utc") or t.get("created_at_utc") or ""
-
-    closed_sorted = sorted(closed, key=_ts)
-
-    # Result counts
-    wins = sum(1 for t in closed_sorted if t.get("result") == "WIN")
-    losses = sum(1 for t in closed_sorted if t.get("result") == "LOSS")
-    ties = sum(1 for t in closed_sorted if t.get("result") == "TIE")
-    unknown = sum(1 for t in closed_sorted if t.get("result") == "UNKNOWN")
-
-    decided = wins + losses  # exclude ties/unknown
-    closed_count = len(closed_sorted)
-
-    # PnL aggregates
-    pnl_sum = 0.0
-    win_pnl = 0.0
-    loss_pnl = 0.0
-    for t in closed_sorted:
-        try:
-            p = float(t.get("pnl") or 0.0)
-        except Exception:
-            p = 0.0
-        pnl_sum += p
-        if p > 0:
-            win_pnl += p
-        elif p < 0:
-            loss_pnl += (-p)
-
-    avg_pnl_closed = (pnl_sum / closed_count) if closed_count else 0.0
-    expectancy_per_decided = (pnl_sum / decided) if decided else 0.0  # useful when ignoring ties/unknown
-
-    # Win rates
-    win_rate_decided = (wins / decided) if decided else 0.0
-    win_rate_closed = (wins / closed_count) if closed_count else 0.0  # includes ties/unknown in denominator
-    tie_rate_closed = (ties / closed_count) if closed_count else 0.0
-
-    # Profit factor
-    profit_factor = (win_pnl / loss_pnl) if loss_pnl > 0 else (float("inf") if win_pnl > 0 else 0.0)
-
-    # Equity curve + max drawdown
-    equity = 0.0
-    peak = 0.0
-    max_dd = 0.0
-    for t in closed_sorted:
-        try:
-            equity += float(t.get("pnl") or 0.0)
-        except Exception:
-            pass
-        if equity > peak:
-            peak = equity
-        dd = peak - equity
-        if dd > max_dd:
-            max_dd = dd
-
-    # Streaks (based on closed results only, in chronological order)
-    # Track current streak and max win/loss streak
-    current_streak_type = None  # "WIN"/"LOSS"/"TIE"/"UNKNOWN"
-    current_streak_len = 0
-
-    max_win_streak = 0
-    max_loss_streak = 0
-
-    win_streak = 0
-    loss_streak = 0
-
-    for t in closed_sorted:
-        r = t.get("result") or "UNKNOWN"
-
-        # current streak
-        if r == current_streak_type:
-            current_streak_len += 1
-        else:
-            current_streak_type = r
-            current_streak_len = 1
-
-        # win/loss streaks
-        if r == "WIN":
-            win_streak += 1
-            loss_streak = 0
-        elif r == "LOSS":
-            loss_streak += 1
-            win_streak = 0
-        else:
-            # ties/unknown reset both win/loss streaks
-            win_streak = 0
-            loss_streak = 0
-
-        if win_streak > max_win_streak:
-            max_win_streak = win_streak
-        if loss_streak > max_loss_streak:
-            max_loss_streak = loss_streak
-
-    # Recent result (last closed trade)
-    last_closed = closed_sorted[-1] if closed_sorted else None
-
-    return {
-        "counts": {
-            "total_records": total,
-            "open": len(open_trades),
-            "closed": closed_count,
-            "wins": wins,
-            "losses": losses,
-            "ties": ties,
-            "unknown": unknown,
-            "decided": decided,
-        },
-        "rates": {
-            "win_rate_decided": round(win_rate_decided, 6),
-            "win_rate_closed": round(win_rate_closed, 6),
-            "tie_rate_closed": round(tie_rate_closed, 6),
-        },
-        "pnl": {
-            "sum": round(pnl_sum, 6),
-            "avg_per_closed_trade": round(avg_pnl_closed, 6),
-            "expectancy_per_decided_trade": round(expectancy_per_decided, 6),
-            "gross_profit": round(win_pnl, 6),
-            "gross_loss": round(loss_pnl, 6),
-            "profit_factor": (profit_factor if profit_factor in (0.0, float("inf")) else round(profit_factor, 6)),
-            "max_drawdown": round(max_dd, 6),
-            "ending_equity": round(equity, 6),
-        },
-        "streaks": {
-            "current": {
-                "type": current_streak_type,
-                "len": current_streak_len if closed_count else 0,
-            },
-            "max_win_streak": max_win_streak,
-            "max_loss_streak": max_loss_streak,
-        },
-        "last_closed_trade": {
-            "id": last_closed.get("id") if last_closed else None,
-            "symbol": last_closed.get("symbol") if last_closed else None,
-            "direction": last_closed.get("direction") if last_closed else None,
-            "result": last_closed.get("result") if last_closed else None,
-            "pnl": last_closed.get("pnl") if last_closed else None,
-            "closed_at_utc": last_closed.get("closed_at_utc") if last_closed else None,
-            "confidence": last_closed.get("confidence") if last_closed else None,
-        } if last_closed else None,
-    }
-
 # -----------------------------
 # Cooldown / Limits
 # -----------------------------
 def last_signal_time_for_symbol(symbol: str):
-    """Scan alerts log backwards and return last SIGNAL time for symbol."""
     if not os.path.exists(LOG_PATH):
         return None
     try:
@@ -361,7 +187,6 @@ def last_signal_time_for_symbol(symbol: str):
     return None
 
 def trades_today_count():
-    """Count number of paper trades created today (DAY_TZ)."""
     if not os.path.exists(TRADES_PATH):
         return 0
     day_key = today_date_str()
@@ -372,7 +197,6 @@ def trades_today_count():
     return c
 
 def open_trades_for_symbol(symbol: str):
-    """Return OPEN trades for a given symbol."""
     symbol = normalize_symbol(symbol)
     if not os.path.exists(TRADES_PATH):
         return []
@@ -386,11 +210,6 @@ def open_trades_for_symbol(symbol: str):
 # Confidence Scoring
 # -----------------------------
 def calculate_confidence(payload: dict, cooldown_ok: bool):
-    """
-    Returns: (confidence:int, breakdown:dict[str,int], reasons:list[str])
-    Score out of 100.
-    We score what we can from the payload we receive.
-    """
     breakdown = {"supertrend": 0, "adx": 0, "stoch": 0, "keltner": 0, "cooldown": 0}
     reasons = []
 
@@ -454,6 +273,142 @@ def calculate_confidence(payload: dict, cooldown_ok: bool):
     return confidence, breakdown, reasons
 
 # -----------------------------
+# Metrics
+# -----------------------------
+def compute_metrics(trades: list[dict], last_n: int | None = None) -> dict:
+    if last_n is not None and last_n > 0:
+        trades = trades[-last_n:]
+
+    total = len(trades)
+    open_trades = [t for t in trades if t.get("status") == "OPEN"]
+    closed = [t for t in trades if t.get("status") == "CLOSED"]
+
+    def _ts(t):
+        return t.get("closed_at_utc") or t.get("created_at_utc") or ""
+
+    closed_sorted = sorted(closed, key=_ts)
+
+    wins = sum(1 for t in closed_sorted if t.get("result") == "WIN")
+    losses = sum(1 for t in closed_sorted if t.get("result") == "LOSS")
+    ties = sum(1 for t in closed_sorted if t.get("result") == "TIE")
+    unknown = sum(1 for t in closed_sorted if t.get("result") == "UNKNOWN")
+
+    decided = wins + losses
+    closed_count = len(closed_sorted)
+
+    pnl_sum = 0.0
+    win_pnl = 0.0
+    loss_pnl = 0.0
+    for t in closed_sorted:
+        try:
+            p = float(t.get("pnl") or 0.0)
+        except Exception:
+            p = 0.0
+        pnl_sum += p
+        if p > 0:
+            win_pnl += p
+        elif p < 0:
+            loss_pnl += (-p)
+
+    avg_pnl_closed = (pnl_sum / closed_count) if closed_count else 0.0
+    expectancy_per_decided = (pnl_sum / decided) if decided else 0.0
+
+    win_rate_decided = (wins / decided) if decided else 0.0
+    win_rate_closed = (wins / closed_count) if closed_count else 0.0
+    tie_rate_closed = (ties / closed_count) if closed_count else 0.0
+
+    profit_factor = (win_pnl / loss_pnl) if loss_pnl > 0 else (float("inf") if win_pnl > 0 else 0.0)
+
+    equity = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in closed_sorted:
+        try:
+            equity += float(t.get("pnl") or 0.0)
+        except Exception:
+            pass
+        if equity > peak:
+            peak = equity
+        dd = peak - equity
+        if dd > max_dd:
+            max_dd = dd
+
+    current_streak_type = None
+    current_streak_len = 0
+    max_win_streak = 0
+    max_loss_streak = 0
+    win_streak = 0
+    loss_streak = 0
+
+    for t in closed_sorted:
+        r = t.get("result") or "UNKNOWN"
+
+        if r == current_streak_type:
+            current_streak_len += 1
+        else:
+            current_streak_type = r
+            current_streak_len = 1
+
+        if r == "WIN":
+            win_streak += 1
+            loss_streak = 0
+        elif r == "LOSS":
+            loss_streak += 1
+            win_streak = 0
+        else:
+            win_streak = 0
+            loss_streak = 0
+
+        if win_streak > max_win_streak:
+            max_win_streak = win_streak
+        if loss_streak > max_loss_streak:
+            max_loss_streak = loss_streak
+
+    last_closed = closed_sorted[-1] if closed_sorted else None
+
+    return {
+        "counts": {
+            "total_records": total,
+            "open": len(open_trades),
+            "closed": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "unknown": unknown,
+            "decided": decided,
+        },
+        "rates": {
+            "win_rate_decided": round(win_rate_decided, 6),
+            "win_rate_closed": round(win_rate_closed, 6),
+            "tie_rate_closed": round(tie_rate_closed, 6),
+        },
+        "pnl": {
+            "sum": round(pnl_sum, 6),
+            "avg_per_closed_trade": round(avg_pnl_closed, 6),
+            "expectancy_per_decided_trade": round(expectancy_per_decided, 6),
+            "gross_profit": round(win_pnl, 6),
+            "gross_loss": round(loss_pnl, 6),
+            "profit_factor": (profit_factor if profit_factor in (0.0, float("inf")) else round(profit_factor, 6)),
+            "max_drawdown": round(max_dd, 6),
+            "ending_equity": round(equity, 6),
+        },
+        "streaks": {
+            "current": {"type": current_streak_type, "len": current_streak_len if closed_count else 0},
+            "max_win_streak": max_win_streak,
+            "max_loss_streak": max_loss_streak,
+        },
+        "last_closed_trade": {
+            "id": last_closed.get("id") if last_closed else None,
+            "symbol": last_closed.get("symbol") if last_closed else None,
+            "direction": last_closed.get("direction") if last_closed else None,
+            "result": last_closed.get("result") if last_closed else None,
+            "pnl": last_closed.get("pnl") if last_closed else None,
+            "closed_at_utc": last_closed.get("closed_at_utc") if last_closed else None,
+            "confidence": last_closed.get("confidence") if last_closed else None,
+        } if last_closed else None,
+    }
+
+# -----------------------------
 # Paper trade lifecycle
 # -----------------------------
 def timedelta_minutes(m: int):
@@ -483,41 +438,29 @@ def create_paper_trade(symbol: str, direction: str, expiry_minutes: int, payload
         "id": trade_id,
         "mode": EXECUTION_MODE,
         "status": "OPEN",
-
         "symbol": symbol,
         "direction": direction,
         "timeframe": str(payload.get("timeframe", "1")),
         "expiry_minutes": int(expiry_minutes),
-
         "stake": PAPER_STAKE,
         "payout": PAPER_PAYOUT,
-
         "confidence": confidence,
         "breakdown": breakdown,
-
         "created_at_utc": created_iso,
-        # Keep UTC date too (useful), but COUNT on created_date_key
         "created_date_utc": now.date().isoformat(),
         "created_date_key": day_key,
-
         "source_alert_received_at_utc": created_iso,
         "source_tv_time_ms": tv_time_ms,
-
         "entry_price": entry_price,
         "exit_price": None,
         "result": None,
         "pnl": None,
-
         "expires_at_utc": (now + timedelta_minutes(expiry_minutes)).isoformat(),
     }
     ndjson_append(TRADES_PATH, trade)
     return trade
 
 def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
-    """
-    Resolve OPEN trades for symbol that have expired, using bar_close as exit_price.
-    Returns: number_resolved
-    """
     if not os.path.exists(TRADES_PATH):
         return 0
 
@@ -611,14 +554,11 @@ def webhook():
 
     # -----------------------------
     # Handle BAR heartbeat
-    # Supports:
-    #  A) per-symbol bar: {"type":"bar","symbol":"EURUSD","close":1.08}
-    #  B) master bar: {"type":"bar","prices":{"EURUSD":1.08,"USDJPY":153.2}}
     # -----------------------------
     if event_type == "bar":
         prices = data.get("prices")
 
-        # Route B: master bar with prices map
+        # master bar
         if isinstance(prices, dict) and prices:
             resolved_total = 0
             symbols_seen = 0
@@ -651,7 +591,7 @@ def webhook():
                 "resolved_trades": resolved_total,
             }), 200
 
-        # Route A: standard per-symbol bar
+        # single symbol bar
         close_val = data.get("close")
         resolved = 0
         close_float = None
@@ -834,27 +774,20 @@ def summary():
     }), 200
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
-
 @app.route("/metrics", methods=["GET"])
 def metrics():
     """
     /metrics
-      - default: all trades in file
+      - default: compute over all trades in file
       - optional: ?last_n=200 to compute over last N records
     """
     trades = ndjson_read_all(TRADES_PATH)
 
-    # Optional window parameter
     last_n = request.args.get("last_n", default=None, type=int)
     if last_n is not None and last_n <= 0:
         last_n = None
 
     out = compute_metrics(trades, last_n=last_n)
-
-    # Helpful context
     out["meta"] = {
         "mode": EXECUTION_MODE,
         "data_dir": DATA_DIR,
@@ -864,6 +797,9 @@ def metrics():
         "window_last_n": last_n,
         "generated_at_utc": utc_now_iso(),
     }
-
     return jsonify(out), 200
 
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
