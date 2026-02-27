@@ -1,3 +1,5 @@
+from flask import Flask, request, jsonify, Response
+import time
 import os
 import json
 import uuid
@@ -62,6 +64,38 @@ ALLOWLIST = set()
 if SYMBOL_ALLOWLIST:
     ALLOWLIST = {s.strip().upper() for s in SYMBOL_ALLOWLIST.split(",") if s.strip()}
 
+# -----------------------------
+# Live "trade open" event bus (SSE)
+# -----------------------------
+EVENT_TTL_SECONDS = 600  # keep last 10 minutes of events
+_trade_events = []       # list of dicts: {"id": int, "ts": float, "data": dict}
+_next_event_id = 1
+
+def emit_trade_open_event(trade: dict) -> None:
+    """Push a 'trade_open' event for the /stream endpoint."""
+    global _next_event_id, _trade_events
+    now_ts = time.time()
+
+    event = {
+        "id": _next_event_id,
+        "ts": now_ts,
+        "data": {
+            "event": "trade_open",
+            "id": trade.get("id"),
+            "symbol": trade.get("symbol"),
+            "direction": trade.get("direction"),
+            "confidence": trade.get("confidence"),
+            "expiry_minutes": trade.get("expiry_minutes"),
+            "entry_price": trade.get("entry_price"),
+            "created_at_utc": trade.get("created_at_utc"),
+        }
+    }
+    _next_event_id += 1
+    _trade_events.append(event)
+
+    # prune old
+    cutoff = now_ts - EVENT_TTL_SECONDS
+    _trade_events = [e for e in _trade_events if e["ts"] >= cutoff]
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -458,7 +492,8 @@ def create_paper_trade(symbol: str, direction: str, expiry_minutes: int, payload
         "expires_at_utc": (now + timedelta_minutes(expiry_minutes)).isoformat(),
     }
     ndjson_append(TRADES_PATH, trade)
-    return trade
+emit_trade_open_event(trade)
+return trade
 
 def resolve_expired_trades_for_symbol(symbol: str, bar_close: float):
     if not os.path.exists(TRADES_PATH):
@@ -803,3 +838,137 @@ def metrics():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/stream", methods=["GET"])
+def stream():
+    """
+    Server-Sent Events stream of trade_open events.
+    Use in browser with EventSource('/stream').
+    """
+    try:
+        last_id = int(request.args.get("last_id", "0"))
+    except Exception:
+        last_id = 0
+
+    def event_generator():
+        sent_heartbeat = 0
+        while True:
+            # send any new events
+            new_events = [e for e in _trade_events if e["id"] > last_id]
+            for e in new_events:
+                nonlocal_last = e["id"]  # (just for clarity)
+                # SSE format
+                yield f"id: {e['id']}\n"
+                yield "event: trade_open\n"
+                yield f"data: {json.dumps(e['data'], ensure_ascii=False)}\n\n"
+                # update last_id in this generator scope
+                nonlocal last_id
+                last_id = nonlocal_last
+
+            # heartbeat every ~15s so proxies keep connection open
+            sent_heartbeat += 1
+            if sent_heartbeat >= 15:
+                yield ": ping\n\n"
+                sent_heartbeat = 0
+
+            time.sleep(1)
+
+    headers = {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+    }
+    return Response(event_generator(), headers=headers)
+
+
+@app.route("/live", methods=["GET"])
+def live():
+    """
+    Lightweight browser page:
+    - Connects to /stream
+    - Beeps once when a trade_open event arrives
+    """
+    html = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Paper Trade Alerts (Beep on Open)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: Arial, sans-serif; padding: 16px; }
+    .status { padding: 10px; border-radius: 8px; background: #f3f3f3; margin-bottom: 12px; }
+    .log { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .row { padding: 10px; border-bottom: 1px solid #eee; }
+    .hint { color: #555; font-size: 14px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>Paper Trade Alerts</h2>
+  <div class="status" id="status">Status: Not connected</div>
+  <p class="hint">
+    Click <b>Enable Sound</b> once (browser requirement). Then leave this tab open.
+    You will hear a short beep whenever a paper trade opens.
+  </p>
+  <button id="enableSound">Enable Sound</button>
+  <div id="events"></div>
+
+<script>
+let audioEnabled = false;
+
+// Simple beep using WebAudio (no file needed)
+function beep() {
+  if (!audioEnabled) return;
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = "sine";
+  o.frequency.value = 880; // A5
+  g.gain.value = 0.08;
+  o.connect(g);
+  g.connect(ctx.destination);
+  o.start();
+  setTimeout(() => { o.stop(); ctx.close(); }, 180);
+}
+
+document.getElementById("enableSound").addEventListener("click", async () => {
+  audioEnabled = true;
+  // unlock audio on iOS/Chrome by creating/resuming context via user gesture
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    ctx.close();
+  } catch (e) {}
+  document.getElementById("enableSound").innerText = "Sound Enabled ✅";
+});
+
+const statusEl = document.getElementById("status");
+const eventsEl = document.getElementById("events");
+
+function addRow(text) {
+  const div = document.createElement("div");
+  div.className = "row log";
+  div.textContent = text;
+  eventsEl.prepend(div);
+}
+
+const es = new EventSource("/stream");
+es.onopen = () => { statusEl.textContent = "Status: Connected ✅"; };
+es.onerror = () => { statusEl.textContent = "Status: Disconnected / retrying…"; };
+
+es.addEventListener("trade_open", (evt) => {
+  try {
+    const data = JSON.parse(evt.data);
+    beep();
+    const line = `OPEN | ${data.symbol} | ${data.direction} | conf=${data.confidence} | exp=${data.expiry_minutes}m | entry=${data.entry_price} | ${data.created_at_utc}`;
+    addRow(line);
+  } catch (e) {
+    addRow("OPEN | (parse error) " + evt.data);
+  }
+});
+</script>
+</body>
+</html>
+"""
+    return Response(html, mimetype="text/html")
